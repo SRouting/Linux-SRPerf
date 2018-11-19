@@ -12,6 +12,7 @@
 #include <linux/net.h>
 #include <linux/module.h>
 #include <net/ip.h>
+#include <net/arp.h>
 #include <net/lwtunnel.h>
 #include <net/netevent.h>
 #include <net/netns/generic.h>
@@ -61,6 +62,72 @@ struct seg6_local_lwt {
 static struct seg6_local_lwt *seg6_local_lwtunnel(struct lwtunnel_state *lwt)
 {
 	return (struct seg6_local_lwt *)lwt->data;
+}
+
+/* cross-connects to IPv4 layer-3 adjacency through an OIF */
+int seg6_xcon4(struct sk_buff *skb, int oif, struct in_addr *nh4)
+{
+
+        struct net *net = dev_net(skb->dev);
+        struct net_device* odev;
+        struct neighbour *neigh;
+        int ret;
+
+	odev = dev_get_by_index_rcu(net, oif);
+	if (!odev)
+		goto drop;
+
+	skb->dev = odev;
+
+
+	rcu_read_lock_bh();
+	neigh = __ipv4_neigh_lookup_noref(skb->dev, nh4->s_addr);
+	if (unlikely(!neigh))
+		neigh = __neigh_create(&arp_tbl, &nh4->s_addr, skb->dev, false);
+	if (!IS_ERR(neigh)) {
+		sock_confirm_neigh(skb, neigh);
+		ret = neigh_output(neigh, skb);
+
+		rcu_read_unlock_bh();
+		return ret;
+	}
+	rcu_read_unlock_bh();
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
+
+/* cross-connects to IPv6 layer-3 adjacency through an OIF */
+int seg6_xcon6(struct sk_buff *skb, int oif, struct in6_addr *nh6)
+{
+
+	struct net *net = dev_net(skb->dev);
+	struct net_device* odev;
+	struct neighbour *neigh;
+	int ret;
+
+	odev = dev_get_by_index_rcu(net, oif);
+	if (!odev)
+		goto drop;
+
+	skb->dev = odev;
+
+	rcu_read_lock_bh();
+	neigh = __ipv6_neigh_lookup_noref(skb->dev, nh6);
+	if (unlikely(!neigh))
+		neigh = __neigh_create(&nd_tbl, nh6, skb->dev, false);
+	if (!IS_ERR(neigh)) {
+		sock_confirm_neigh(skb, neigh);
+		ret = neigh_output(neigh, skb);
+		rcu_read_unlock_bh();
+		return ret;
+	}
+	rcu_read_unlock_bh();
+
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
 }
 
 static struct ipv6_sr_hdr *get_srh(struct sk_buff *skb)
@@ -225,10 +292,7 @@ static int input_action_end_x(struct sk_buff *skb, struct seg6_local_lwt *slwt)
 
 	advance_nextseg(srh, &ipv6_hdr(skb)->daddr);
 
-	seg6_lookup_nexthop(skb, &slwt->nh6, 0);
-
-	return dst_input(skb);
-
+	return seg6_xcon6(skb, slwt->oif, &slwt->nh6);
 drop:
 	kfree_skb(skb);
 	return -EINVAL;
@@ -314,7 +378,6 @@ drop:
 static int input_action_end_dx6(struct sk_buff *skb,
 				struct seg6_local_lwt *slwt)
 {
-	struct in6_addr *nhaddr = NULL;
 
 	/* this function accepts IPv6 encapsulated packets, with either
 	 * an SRH with SL=0, or no SRH.
@@ -326,19 +389,7 @@ static int input_action_end_dx6(struct sk_buff *skb,
 	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
 		goto drop;
 
-	/* The inner packet is not associated to any local interface,
-	 * so we do not call netif_rx().
-	 *
-	 * If slwt->nh6 is set to ::, then lookup the nexthop for the
-	 * inner packet's DA. Otherwise, use the specified nexthop.
-	 */
-
-	if (!ipv6_addr_any(&slwt->nh6))
-		nhaddr = &slwt->nh6;
-
-	seg6_lookup_nexthop(skb, nhaddr, 0);
-
-	return dst_input(skb);
+	return seg6_xcon6(skb, slwt->oif, &slwt->nh6);
 drop:
 	kfree_skb(skb);
 	return -EINVAL;
@@ -347,9 +398,6 @@ drop:
 static int input_action_end_dx4(struct sk_buff *skb,
 				struct seg6_local_lwt *slwt)
 {
-	struct iphdr *iph;
-	__be32 nhaddr;
-	int err;
 
 	if (!decap_and_validate(skb, IPPROTO_IPIP))
 		goto drop;
@@ -359,17 +407,7 @@ static int input_action_end_dx4(struct sk_buff *skb,
 
 	skb->protocol = htons(ETH_P_IP);
 
-	iph = ip_hdr(skb);
-
-	nhaddr = slwt->nh4.s_addr ?: iph->daddr;
-
-	skb_dst_drop(skb);
-
-	err = ip_route_input(skb, nhaddr, iph->saddr, 0, skb->dev);
-	if (err)
-		goto drop;
-
-	return dst_input(skb);
+	return seg6_xcon4(skb, slwt->oif, &slwt->nh4);
 
 drop:
 	kfree_skb(skb);
@@ -539,7 +577,8 @@ static struct seg6_action_desc seg6_action_table[] = {
 	},
 	{
 		.action		= SEG6_LOCAL_ACTION_END_X,
-		.attrs		= (1 << SEG6_LOCAL_NH6),
+		.attrs		= (1 << SEG6_LOCAL_NH6) |
+				  (1 << SEG6_LOCAL_OIF),
 		.input		= input_action_end_x,
 	},
 	{
@@ -554,12 +593,14 @@ static struct seg6_action_desc seg6_action_table[] = {
 	},
 	{
 		.action		= SEG6_LOCAL_ACTION_END_DX6,
-		.attrs		= (1 << SEG6_LOCAL_NH6),
+		.attrs		= (1 << SEG6_LOCAL_NH6) |
+				  (1 << SEG6_LOCAL_OIF),
 		.input		= input_action_end_dx6,
 	},
 	{
 		.action		= SEG6_LOCAL_ACTION_END_DX4,
-		.attrs		= (1 << SEG6_LOCAL_NH4),
+		.attrs		= (1 << SEG6_LOCAL_NH4) |
+				  (1 << SEG6_LOCAL_OIF),
 		.input		= input_action_end_dx4,
 	},
 	{
